@@ -39,6 +39,39 @@
       </div>
     </div>
   `;
+class QuickTransferWidget extends HTMLElement {
+  connectedCallback() {
+    const config = this.getAttribute("data-buttons");
+    let buttons = [];
+    try {
+      buttons = JSON.parse(config);
+    } catch (e) {
+      console.error("Invalid button config", e);
+    }
+
+    this.innerHTML = `
+      <div style="padding:8px">
+        ${buttons.map(b =>
+          `<button style="margin:4px;padding:8px 12px;cursor:pointer">${b.label}</button>`
+        ).join("")}
+      </div>
+    `;
+
+    // Attach click listeners
+    const btnEls = this.querySelectorAll("button");
+    btnEls.forEach((btn, i) => {
+      btn.addEventListener("click", () => {
+        const dest = buttons[i].dest;
+        console.log("Would blind transfer to", dest);
+        // TODO: invoke Desktop JS SDK to perform the transfer
+        // e.g., window.AgentXAPI.telephony.transferBlind({address: dest})
+      });
+    });
+  }
+}
+
+// Register under the name Cisco expects
+customElements.define("custom-widget", QuickTransferWidget);
 
   class CustomTransferWidget extends HTMLElement {
     constructor() {
