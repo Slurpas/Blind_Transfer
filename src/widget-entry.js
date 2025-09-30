@@ -199,7 +199,7 @@ class QuickTransfersSDKWidget extends HTMLElement {
   }
 }
 
-if (!customElements.get("quick-transfers-widget")) {
-  customElements.define("quick-transfers-widget", QuickTransfersSDKWidget);
+if (!customElements.get("custom-widget")) {
+  customElements.define("custom-widget", QuickTransfersSDKWidget);
   console.log("[QuickTransfers] quick-transfers-widget registered");
 }
