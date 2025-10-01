@@ -1,27 +1,26 @@
-const path = require('path');
+// webpack.config.js (minimal; merge with your existing config if you already had loaders/etc)
+const path = require("path");
 
 module.exports = {
-  entry: './src/widget-entry.js',
+  mode: "production", // or "development" while testing
+  entry: path.resolve(__dirname, "src/widget-entry.js"),
   output: {
-    path: path.resolve(__dirname, 'build'),
-    filename: 'bundle.js',
-    libraryTarget: 'umd'
+    filename: "bundle.js",
+    path: path.resolve(__dirname, "build"),
+    libraryTarget: "umd",
+    globalObject: "this"
   },
   module: {
     rules: [
       {
-        test: /\.m?js$/,
+        test: /\.js$/,
         exclude: /node_modules/,
-        use: {
-          loader: "babel-loader",
-          options: { presets: ['@babel/preset-env'] }
-        }
+        use: { loader: "babel-loader", options: { presets: ["@babel/preset-env"] } }
       }
     ]
   },
-  resolve: {
-    fallback: {
-      // Browser polyfills if needed
-    }
+  externals: {
+    // Tell webpack: do NOT bundle @wxcc-desktop/sdk — it will be provided by the Desktop at runtime.
+    "@wxcc-desktop/sdk": "Desktop"
   }
 };
