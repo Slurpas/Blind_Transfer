@@ -25,7 +25,6 @@
   function loadDesktop() {
     if (sdkPromise) return sdkPromise;
     sdkPromise = (async () => {
-      // Use a global if one ever exists
       if (window.Desktop && window.Desktop.agentContact) {
         console.log(LOG, "Using window.Desktop");
         return window.Desktop;
@@ -33,15 +32,12 @@
       for (const url of SDK_URLS) {
         try {
           const mod = await import(url);
-          const D =
-            mod.Desktop ||
-            (mod.default && (mod.default.Desktop || mod.default)) ||
-            null;
+          const D = mod.Desktop || (mod.default && (mod.default.Desktop || mod.default)) || null;
           if (D && D.agentContact) {
             console.log(LOG, "SDK loaded from", url);
             return D;
           }
-          console.warn(LOG, "Module loaded but no Desktop export found:", url, Object.keys(mod));
+          console.warn(LOG, "Module loaded but no Desktop export found:", url);
         } catch (e) {
           console.warn(LOG, "SDK load failed from", url, e);
         }
@@ -156,7 +152,6 @@
       }
     }
 
-    // Status is shown as text in full mode and as a hover tooltip in compact mode
     _setStatus(text) {
       if (this._statusEl) this._statusEl.textContent = text;
       this.title = "Quick Transfers: " + text;
@@ -185,7 +180,7 @@
             alert("Transfer destination not configured");
             return;
           }
-          this.handleTransfer(String(b.dest), b.label);
+          this.handleTransfer(String(b.dest).trim(), b.label);
         });
       });
     }
@@ -201,14 +196,12 @@
 
       await initDesktop(D);
 
-      // Event listeners (best effort; names vary between SDK versions)
       if (D.agentContact && D.agentContact.addEventListener) {
         this._events.forEach(evt => {
           try { D.agentContact.addEventListener(evt, this._boundUpdate); } catch (e) {}
         });
       }
 
-      // Polling fallback so button state is always correct
       clearInterval(this._poll);
       this._poll = setInterval(this._boundUpdate, 2000);
 
@@ -238,7 +231,7 @@
 
         const state = String(task.state || i.state || "").toLowerCase();
         const ended = ["ended", "wrapup", "wrap_up", "closed", "terminated"].includes(state);
-        if (ended || task.isTerminated || i.isTerminated) continue;
+        if (ended || task.isTerminated || i.isTerminated || task.isWrapUp) continue;
 
         return task.interactionId || i.interactionId || key;
       }
@@ -273,44 +266,33 @@
       this._setStatus(`Transferring to ${label || dest}…`);
       console.log(LOG, "Blind transfer", { interactionId, dest });
 
-      // Payload formats differ between SDK versions: try current format first, then legacy
-      const attempts = [
-        {
-          name: "dialNumber",
-          payload: { interactionId, data: { to: dest, destinationType: "dialNumber", mediaType: "telephony" } }
-        },
-        {
-          name: "legacy destAgentDN",
-          payload: { interactionId, data: { destAgentDN: dest, destAgentId: dest, mediaType: "telephony" } }
-        }
-      ];
-
-      let lastErr = null;
-      for (const a of attempts) {
-        try {
-          await D.agentContact.blindTransfer(a.payload);
-          console.log(LOG, `Transfer succeeded (${a.name})`);
-          this._setStatus(`Transferred to ${label || dest}`);
-          lastErr = null;
-          break;
-        } catch (err) {
-          lastErr = err;
-          console.warn(LOG, `Transfer attempt "${a.name}" failed`, err);
-        }
-      }
-
-      this._busy = false;
-
-      if (lastErr) {
-        const msg = (lastErr && (lastErr.message || lastErr.reason)) || JSON.stringify(lastErr);
+      try {
+        // Verified working format for dial-number (DN) blind transfer
+        await D.agentContact.blindTransfer({
+          interactionId,
+          data: {
+            destAgentId: dest,
+            destinationType: "DN",
+            mediaType: "telephony"
+          }
+        });
+        console.log(LOG, "Transfer succeeded to", dest);
+        this._setStatus(`Transferred to ${label || dest}`);
+      } catch (err) {
+        console.error(LOG, "Transfer failed", err);
+        const msg =
+          (err && err.details && err.details.msg && err.details.msg.errorMessage) ||
+          (err && err.message) ||
+          JSON.stringify(err);
         alert("Transfer failed: " + msg);
         this._setStatus("Transfer failed");
+      } finally {
+        this._busy = false;
+        this.updateButtons();
       }
-
-      this.updateButtons();
     }
   }
 
   customElements.define(TAG, QuickTransfersWidget);
-  console.log(LOG, TAG, "defined");
+  console.log(LOG, TAG, "defined (v3)");
 })();
