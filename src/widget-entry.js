@@ -16,6 +16,9 @@ const Desktop = (WXSDK && (WXSDK.default || WXSDK.Desktop || WXSDK)) || (typeof 
 const template = document.createElement("template");
 template.innerHTML = `
   <style>
+    :host { display: block; }
+
+    .qt-root { display: block; }
     .qt-container { display:flex; flex-wrap:wrap; gap:8px; padding:10px; }
     .qt-button {
       flex: 1 0 30%;
@@ -32,8 +35,40 @@ template.innerHTML = `
     .qt-button:hover { background:#005F7A; }
     .qt-button:disabled { background:#ccc; cursor:not-allowed; }
     #status { font-size:12px; color:#666; margin-top:8px; }
+
+    /* ---------- compact / header mode ---------- */
+    :host([compact]) {
+      display: flex;
+      align-items: center;
+      height: 100%;
+    }
+    :host([compact]) .qt-root {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      gap: 8px;
+      height: 100%;
+    }
+    :host([compact]) .qt-container {
+      flex-wrap: nowrap;
+      padding: 0;
+      gap: 6px;
+      align-items: center;
+    }
+    :host([compact]) .qt-button {
+      flex: 0 0 auto;
+      min-width: 0;
+      padding: 6px 12px;
+      font-size: 13px;
+      height: 32px;
+      line-height: 1;
+      white-space: nowrap;
+    }
+    :host([compact]) #status {
+      display: none;
+    }
   </style>
-  <div>
+  <div class="qt-root">
     <div class="qt-container" id="btns"></div>
     <div id="status">Starting…</div>
   </div>
