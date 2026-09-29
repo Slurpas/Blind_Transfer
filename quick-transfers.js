@@ -1,10 +1,77 @@
-// quick-transfers.js — no build step required
+// quick-transfers.js — Quick Transfers header widget (no build step required)
+// Registers <agentx-qt-transfers-widget>
+// Loads @wxcc-desktop/sdk from a CDN at runtime (window.Desktop is not exposed by the Desktop)
+
 (function () {
-  if (customElements.get("agentx-qt-transfers-widget")) {
-    console.log("[QuickTransfers] already defined, skipping");
+  "use strict";
+
+  const TAG = "agentx-qt-transfers-widget";
+  const LOG = "[QuickTransfers]";
+
+  if (customElements.get(TAG)) {
+    console.log(LOG, "already defined, skipping");
     return;
   }
 
+  // ---------------------------------------------------------------------------
+  // SDK loading (shared by all widget instances)
+  // ---------------------------------------------------------------------------
+  const SDK_URLS = [
+    "https://cdn.jsdelivr.net/npm/@wxcc-desktop/sdk/+esm",
+    "https://esm.sh/@wxcc-desktop/sdk"
+  ];
+
+  let sdkPromise = null;
+  function loadDesktop() {
+    if (sdkPromise) return sdkPromise;
+    sdkPromise = (async () => {
+      // Use a global if one ever exists
+      if (window.Desktop && window.Desktop.agentContact) {
+        console.log(LOG, "Using window.Desktop");
+        return window.Desktop;
+      }
+      for (const url of SDK_URLS) {
+        try {
+          const mod = await import(url);
+          const D =
+            mod.Desktop ||
+            (mod.default && (mod.default.Desktop || mod.default)) ||
+            null;
+          if (D && D.agentContact) {
+            console.log(LOG, "SDK loaded from", url);
+            return D;
+          }
+          console.warn(LOG, "Module loaded but no Desktop export found:", url, Object.keys(mod));
+        } catch (e) {
+          console.warn(LOG, "SDK load failed from", url, e);
+        }
+      }
+      return null;
+    })();
+    return sdkPromise;
+  }
+
+  let initPromise = null;
+  function initDesktop(D) {
+    if (initPromise) return initPromise;
+    initPromise = (async () => {
+      try {
+        if (D.config && typeof D.config.init === "function") {
+          await D.config.init({ widgetName: "quick-transfers", widgetProvider: "Axis" });
+        }
+        console.log(LOG, "SDK initialized");
+        return true;
+      } catch (e) {
+        console.error(LOG, "Desktop.config.init failed", e);
+        return false;
+      }
+    })();
+    return initPromise;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Template
+  // ---------------------------------------------------------------------------
   const template = document.createElement("template");
   template.innerHTML = `
     <style>
@@ -16,11 +83,11 @@
         background:#007AA3; color:#fff; border:none; border-radius:6px;
         font-size:14px; cursor:pointer; transition:background 0.2s ease;
       }
-      .qt-button:hover { background:#005F7A; }
+      .qt-button:hover:not(:disabled) { background:#005F7A; }
       .qt-button:disabled { background:#ccc; cursor:not-allowed; }
       #status { font-size:12px; color:#666; margin-top:8px; }
 
-      /* compact / header mode */
+      /* ---------- compact / header mode ---------- */
       :host([compact]) { display:flex; align-items:center; height:100%; }
       :host([compact]) .qt-root {
         display:flex; flex-direction:row; align-items:center; gap:8px; height:100%;
@@ -40,13 +107,27 @@
     </div>
   `;
 
+  // ---------------------------------------------------------------------------
+  // Widget
+  // ---------------------------------------------------------------------------
   class QuickTransfersWidget extends HTMLElement {
     constructor() {
       super();
       this.attachShadow({ mode: "open" });
       this.shadowRoot.appendChild(template.content.cloneNode(true));
       this._buttons = [];
+      this._D = null;
+      this._busy = false;
+      this._poll = null;
       this._boundUpdate = this.updateButtons.bind(this);
+      this._events = [
+        "eAgentContact",
+        "eAgentContactAssigned",
+        "eAgentContactEnded",
+        "eAgentContactWrappedUp",
+        "eAgentOfferContact",
+        "eAgentWrapup"
+      ];
     }
 
     connectedCallback() {
@@ -55,25 +136,30 @@
 
       const cfg = this.getAttribute("data-buttons");
       try {
-        if (cfg) this._buttons = JSON.parse(cfg);
+        this._buttons = cfg ? JSON.parse(cfg) : [];
       } catch (e) {
-        console.warn("[QuickTransfers] invalid data-buttons JSON", e);
+        console.warn(LOG, "invalid data-buttons JSON", e);
         this._buttons = [];
       }
 
       this.renderButtons();
-      this.initWidget();
+      this.start();
     }
 
     disconnectedCallback() {
-      try {
-        const d = this._getDesktop();
-        if (d && d.agentContact && d.agentContact.removeEventListener) {
-          d.agentContact.removeEventListener("eAgentContactUpdated", this._boundUpdate);
-          d.agentContact.removeEventListener("eAgentContactStarted", this._boundUpdate);
-          d.agentContact.removeEventListener("eAgentContactEnded", this._boundUpdate);
-        }
-      } catch (e) {}
+      clearInterval(this._poll);
+      const D = this._D;
+      if (D && D.agentContact && D.agentContact.removeEventListener) {
+        this._events.forEach(evt => {
+          try { D.agentContact.removeEventListener(evt, this._boundUpdate); } catch (e) {}
+        });
+      }
+    }
+
+    // Status is shown as text in full mode and as a hover tooltip in compact mode
+    _setStatus(text) {
+      if (this._statusEl) this._statusEl.textContent = text;
+      this.title = "Quick Transfers: " + text;
     }
 
     _escape(s = "") {
@@ -82,122 +168,149 @@
       );
     }
 
-    _getDesktop() {
-      return (typeof window !== "undefined" && (window.Desktop || (window.top && window.top.Desktop))) || null;
-    }
-
     renderButtons() {
       if (!this._buttons.length) {
         this._btnsDiv.innerHTML = `<div style="color:#666">No buttons configured</div>`;
         return;
       }
       this._btnsDiv.innerHTML = this._buttons
-        .map((b, i) => `<button class="qt-button transfer-btn" data-idx="${i}" disabled>${this._escape(b.label)}</button>`)
+        .map((b, i) =>
+          `<button class="qt-button transfer-btn" data-idx="${i}" disabled>${this._escape(b.label)}</button>`)
         .join("");
       this._btnsDiv.querySelectorAll(".transfer-btn").forEach(btn => {
         btn.addEventListener("click", ev => {
           const idx = parseInt(ev.currentTarget.getAttribute("data-idx"), 10);
-          const dest = this._buttons[idx] && this._buttons[idx].dest;
-          if (!dest) { alert("Transfer destination not configured"); return; }
-          this.handleTransfer(dest);
+          const b = this._buttons[idx];
+          if (!b || !b.dest) {
+            alert("Transfer destination not configured");
+            return;
+          }
+          this.handleTransfer(String(b.dest), b.label);
         });
       });
     }
 
-    async initWidget() {
-      const d = this._getDesktop();
-      if (!d) {
-        this._statusEl.textContent = "SDK not available (window.Desktop undefined)";
+    async start() {
+      this._setStatus("Loading SDK…");
+      const D = await loadDesktop();
+      if (!D) {
+        this._setStatus("SDK could not be loaded (see console)");
         return;
       }
-      try {
-        if (d.config && typeof d.config.init === "function") await d.config.init();
-        this._statusEl.textContent = "SDK initialized";
-      } catch (err) {
-        console.error("[QuickTransfers] SDK init failed", err);
-        this._statusEl.textContent = "SDK init failed";
-        return;
+      this._D = D;
+
+      await initDesktop(D);
+
+      // Event listeners (best effort; names vary between SDK versions)
+      if (D.agentContact && D.agentContact.addEventListener) {
+        this._events.forEach(evt => {
+          try { D.agentContact.addEventListener(evt, this._boundUpdate); } catch (e) {}
+        });
       }
-      try {
-        if (d.agentContact && d.agentContact.addEventListener) {
-          d.agentContact.addEventListener("eAgentContactUpdated", this._boundUpdate);
-          d.agentContact.addEventListener("eAgentContactStarted", this._boundUpdate);
-          d.agentContact.addEventListener("eAgentContactEnded", this._boundUpdate);
-        }
-      } catch (e) {}
+
+      // Polling fallback so button state is always correct
+      clearInterval(this._poll);
+      this._poll = setInterval(this._boundUpdate, 2000);
+
       this.updateButtons();
     }
 
-    async updateButtons() {
-      const d = this._getDesktop();
-      const btns = this.shadowRoot.querySelectorAll(".transfer-btn");
-      if (!d) {
-        btns.forEach(b => (b.disabled = true));
-        this._statusEl.textContent = "No active call (SDK not available)";
-        return;
-      }
-      try {
-        if (d.agentContact && typeof d.agentContact.getSelectedContact === "function") {
-          const contact = d.agentContact.getSelectedContact();
-          const active = !!(contact && contact.mediaType === "telephony");
-          btns.forEach(b => (b.disabled = !active));
-          this._statusEl.textContent = active ? "Active call detected" : "No active call";
-          return;
-        }
-        if (d.actions && typeof d.actions.getTaskMap === "function") {
-          const map = await d.actions.getTaskMap();
-          let found = false;
-          if (map) for (const [, t] of map) if (t && t.mediaType === "telephony") { found = true; break; }
-          btns.forEach(b => (b.disabled = !found));
-          this._statusEl.textContent = found ? "Active call detected" : "No active call";
-          return;
-        }
-      } catch (e) {
-        console.warn("[QuickTransfers] updateButtons error", e);
-      }
-      btns.forEach(b => (b.disabled = true));
-      this._statusEl.textContent = "No active call";
-    }
+    // Returns interactionId of the first active telephony task, or null
+    async _findActiveCall() {
+      const D = this._D;
+      if (!D || !D.actions || typeof D.actions.getTaskMap !== "function") return null;
 
-    async getInteractionIdFallback() {
-      const d = this._getDesktop();
-      if (!d || !d.actions || typeof d.actions.getTaskMap !== "function") return null;
+      let map;
       try {
-        const map = await d.actions.getTaskMap();
-        if (!map) return null;
-        for (const [, t] of map) if (t && t.interactionId) return t.interactionId;
-      } catch (e) {}
+        map = await D.actions.getTaskMap();
+      } catch (e) {
+        console.warn(LOG, "getTaskMap failed", e);
+        return null;
+      }
+      if (!map) return null;
+
+      const entries = map instanceof Map ? Array.from(map.entries()) : Object.entries(map);
+      for (const [key, task] of entries) {
+        if (!task) continue;
+        const i = task.interaction || {};
+        const media = task.mediaType || i.mediaType || task.mediaChannel;
+        if (media !== "telephony") continue;
+
+        const state = String(task.state || i.state || "").toLowerCase();
+        const ended = ["ended", "wrapup", "wrap_up", "closed", "terminated"].includes(state);
+        if (ended || task.isTerminated || i.isTerminated) continue;
+
+        return task.interactionId || i.interactionId || key;
+      }
       return null;
     }
 
-    async handleTransfer(dest) {
-      const d = this._getDesktop();
-      if (!d) { alert("Desktop SDK not available — cannot transfer."); return; }
-      try {
-        let contact = null;
-        if (d.agentContact && typeof d.agentContact.getSelectedContact === "function") {
-          contact = d.agentContact.getSelectedContact();
-        }
-        let interactionId = (contact && contact.interactionId) || (await this.getInteractionIdFallback());
-        if (!interactionId) throw new Error("No active call available to transfer");
+    async updateButtons() {
+      if (this._busy) return;
+      const btns = this.shadowRoot.querySelectorAll(".transfer-btn");
+      const interactionId = await this._findActiveCall();
+      const active = !!interactionId;
+      btns.forEach(b => (b.disabled = !active));
+      this._setStatus(active ? "Active call" : "No active call");
+    }
 
-        if (d.agentContact && typeof d.agentContact.blindTransfer === "function") {
-          await d.agentContact.blindTransfer({
-            interactionId,
-            data: { to: String(dest), destinationType: "DN", mediaType: "telephony" }
-          });
-          this._statusEl.textContent = `Transfer attempted to ${dest}`;
-          return;
-        }
-        throw new Error("blindTransfer API not available");
-      } catch (err) {
-        console.error("[QuickTransfers] Transfer failed", err);
-        alert("Transfer failed: " + (err.message || String(err)));
-        this._statusEl.textContent = "Transfer failed";
+    async handleTransfer(dest, label) {
+      const D = this._D;
+      if (!D || !D.agentContact || typeof D.agentContact.blindTransfer !== "function") {
+        alert("Transfer API not available.");
+        return;
       }
+
+      const interactionId = await this._findActiveCall();
+      if (!interactionId) {
+        alert("No active call to transfer.");
+        return;
+      }
+
+      const btns = this.shadowRoot.querySelectorAll(".transfer-btn");
+      this._busy = true;
+      btns.forEach(b => (b.disabled = true));
+      this._setStatus(`Transferring to ${label || dest}…`);
+      console.log(LOG, "Blind transfer", { interactionId, dest });
+
+      // Payload formats differ between SDK versions: try current format first, then legacy
+      const attempts = [
+        {
+          name: "dialNumber",
+          payload: { interactionId, data: { to: dest, destinationType: "dialNumber", mediaType: "telephony" } }
+        },
+        {
+          name: "legacy destAgentDN",
+          payload: { interactionId, data: { destAgentDN: dest, destAgentId: dest, mediaType: "telephony" } }
+        }
+      ];
+
+      let lastErr = null;
+      for (const a of attempts) {
+        try {
+          await D.agentContact.blindTransfer(a.payload);
+          console.log(LOG, `Transfer succeeded (${a.name})`);
+          this._setStatus(`Transferred to ${label || dest}`);
+          lastErr = null;
+          break;
+        } catch (err) {
+          lastErr = err;
+          console.warn(LOG, `Transfer attempt "${a.name}" failed`, err);
+        }
+      }
+
+      this._busy = false;
+
+      if (lastErr) {
+        const msg = (lastErr && (lastErr.message || lastErr.reason)) || JSON.stringify(lastErr);
+        alert("Transfer failed: " + msg);
+        this._setStatus("Transfer failed");
+      }
+
+      this.updateButtons();
     }
   }
 
-  customElements.define("agentx-qt-transfers-widget", QuickTransfersWidget);
-  console.log("[QuickTransfers] agentx-qt-transfers-widget defined");
+  customElements.define(TAG, QuickTransfersWidget);
+  console.log(LOG, TAG, "defined");
 })();
