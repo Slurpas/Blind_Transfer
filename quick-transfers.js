@@ -4,13 +4,14 @@
 // Layout "properties":
 //   buttons     Array of { label, dest, color?, textColor?, group? }
 //   maxVisible  Max number of real buttons; the rest go into the "More…" dropdown.
-//               Buttons that don't fit the available width also move into "More…" automatically.
 //
 // Layout "attributes":
 //   data-buttons      Same array as an escaped JSON string (fallback)
 //   data-max-visible  Same as maxVisible
 //   data-rows         "1" (default) or "2" = two rows of smaller buttons in the header
 //   data-confirm      "true" = ask "Transfer to X?" before transferring
+//   data-reserve      Pixels reserved for the other header items (default 700).
+//                     Widget width budget = window width - data-reserve.
 //   compact           Header mode
 
 (function () {
@@ -18,7 +19,7 @@
 
   const TAG = "agentx-qt-transfers-widget";
   const LOG = "[QuickTransfers]";
-  const VERSION = "v5";
+  const VERSION = "v6";
 
   if (customElements.get(TAG)) return;
 
@@ -90,10 +91,9 @@
   const template = document.createElement("template");
   template.innerHTML = `
     <style>
-      /* The host takes the space it is given and never forces the header wider */
-      :host { display:block; flex:1 1 0; min-width:0; max-width:100%; overflow:hidden; }
+      /* Content-sized, but capped by a max-width budget set from JS */
+      :host { display:inline-block; overflow:hidden; vertical-align:middle; }
 
-      /* The inner row is sized to its content so it can be measured */
       .qt-root { display:inline-flex; align-items:center; gap:8px; padding:10px; width:max-content; box-sizing:border-box; }
       .qt-buttons { display:flex; flex-wrap:nowrap; gap:8px; align-items:center; }
       .qt-button {
@@ -136,7 +136,7 @@
   // Widget
   // ---------------------------------------------------------------------------
   class QuickTransfersWidget extends HTMLElement {
-    static get observedAttributes() { return ["data-buttons", "data-max-visible", "data-rows", "compact"]; }
+    static get observedAttributes() { return ["data-buttons", "data-max-visible", "data-rows", "data-reserve", "compact"]; }
 
     constructor() {
       super();
@@ -151,9 +151,9 @@
       this._busy = false;
       this._D = null;
       this._poll = null;
-      this._ro = null;
       this._raf = null;
-      this._lastWidth = -1;
+      this._lastLog = "";
+      this._onResize = () => this._scheduleFit();
       this._boundUpdate = this.updateButtons.bind(this);
       this._events = ["eAgentContact", "eAgentContactAssigned", "eAgentContactEnded",
                       "eAgentContactWrappedUp", "eAgentOfferContact", "eAgentWrapup"];
@@ -170,13 +170,13 @@
     set buttons(v) {
       if (typeof v === "string") { try { v = JSON.parse(v); } catch (e) { v = null; } }
       this._buttonsProp = Array.isArray(v) ? v : null;
-      if (this.isConnected) this._fit();
+      if (this.isConnected) this._scheduleFit();
     }
     get maxVisible() { return this._maxVisibleProp; }
     set maxVisible(v) {
       const n = parseInt(v, 10);
       this._maxVisibleProp = isNaN(n) ? undefined : n;
-      if (this.isConnected) this._fit();
+      if (this.isConnected) this._scheduleFit();
     }
 
     attributeChangedCallback() { if (this.isConnected) this._scheduleFit(); }
@@ -184,27 +184,15 @@
     connectedCallback() {
       this._upgradeProperty("buttons");
       this._upgradeProperty("maxVisible");
+      window.addEventListener("resize", this._onResize); // also fires on browser zoom
       this._fit();
-
-      // Re-fit whenever the space available to the widget changes (resize, zoom, etc.)
-      if (window.ResizeObserver) {
-        this._ro = new ResizeObserver(() => {
-          const w = Math.round(this.clientWidth);
-          if (w !== this._lastWidth) {
-            this._lastWidth = w;
-            this._scheduleFit();
-          }
-        });
-        this._ro.observe(this);
-      } else {
-        window.addEventListener("resize", () => this._scheduleFit());
-      }
-
+      setTimeout(() => this._scheduleFit(), 500);   // re-fit once the header has settled
+      setTimeout(() => this._scheduleFit(), 2000);
       this.start();
     }
 
     disconnectedCallback() {
-      if (this._ro) { this._ro.disconnect(); this._ro = null; }
+      window.removeEventListener("resize", this._onResize);
       if (this._raf) { cancelAnimationFrame(this._raf); this._raf = null; }
       clearInterval(this._poll);
       const D = this._D;
@@ -233,6 +221,13 @@
       return this.getAttribute("data-rows") === "2" ? 10 : 5;
     }
 
+    // Width budget = window width minus space reserved for other header items
+    _getBudget() {
+      const r = parseInt(this.getAttribute("data-reserve"), 10);
+      const reserve = isNaN(r) ? 700 : Math.max(0, r);
+      return Math.max(120, window.innerWidth - reserve);
+    }
+
     _escape(s = "") {
       return String(s).replace(/[&<>"'`]/g, c =>
         ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;", "`": "&#96;" }[c]));
@@ -244,7 +239,7 @@
       return { bg, fg };
     }
 
-    // Finds the largest number of visible buttons that fits the available width
+    // Finds the largest number of visible buttons that fits the width budget
     _fit() {
       this._list = this._getList();
       if (!this._list.length) {
@@ -254,24 +249,26 @@
       }
 
       const max = Math.min(this._getMaxVisible(), this._list.length);
-      const avail = this.clientWidth;
+      const budget = this._getBudget();
+      this.style.maxWidth = budget + "px";
 
-      // Not laid out yet (hidden or still loading): render everything, re-fit on resize
-      if (!avail) { this._render(max); return; }
+      const fits = () => this._root.scrollWidth <= budget;
 
-      const fits = () => this._root.offsetWidth <= avail + 1;
-
+      let best = max;
       this._render(max);
-      if (fits()) return;
-
-      // Binary search for the largest count that fits
-      let lo = 0, hi = max - 1, best = 0;
-      while (lo <= hi) {
-        const mid = (lo + hi) >> 1;
-        this._render(mid);
-        if (fits()) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
+      if (!fits()) {
+        let lo = 0, hi = max - 1;
+        best = 0;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          this._render(mid);
+          if (fits()) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
+        }
+        this._render(best);
       }
-      this._render(best);
+
+      const msg = `fit: budget ${budget}px (window ${window.innerWidth}px) → ${best}/${this._list.length} buttons`;
+      if (msg !== this._lastLog) { console.log(LOG, msg); this._lastLog = msg; }
     }
 
     // Renders the first n entries as buttons and the rest in the "More…" dropdown
