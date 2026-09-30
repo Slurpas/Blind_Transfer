@@ -1,5 +1,5 @@
 // quick-transfers.js — Quick Transfers header widget (no build step required)
-// Registers <agentx-qt-transfers-widget-v7>. ALL configuration lives in the desktop layout JSON.
+// Registers <agentx-qt-transfers-widget-v8>. ALL configuration lives in the desktop layout JSON.
 //
 // Layout "properties":
 //   buttons     Array of { label, dest, color?, textColor?, group? }
@@ -10,23 +10,20 @@
 //   data-max-visible  Same as maxVisible
 //   data-rows         "1" (default) or "2" = two rows of smaller buttons in the header
 //   data-confirm      "true" = ask "Transfer to X?" before transferring
-//   data-reserve      Fallback only: pixels reserved for other header items (default 300).
-//                     Used when the parent container has no measurable width yet.
-//                     Normal budget = inner width of the parent (wrapper) element.
 //   compact           Header mode
 //
-// NOTE: The tag name carries the version. When you ship a breaking change, bump
-// TAG + VERSION here AND "comp" + "?v=" in the layout, otherwise a cached layout
-// can register the old class first and the new one is silently skipped.
+// Width budget = inner width of the parent wrapper. The wrapper MUST use
+// "flex:1 1 0px" so its width comes from free header space, not from our content.
+//
+// NOTE: The tag name carries the version. When you ship a change, bump
+// TAG + VERSION here AND "comp" + "?v=" in the layout.
 
 (function () {
   "use strict";
 
-  const TAG = "agentx-qt-transfers-widget-v7";
+  const TAG = "agentx-qt-transfers-widget-v8";
   const LOG = "[QuickTransfers]";
-  const VERSION = "v7";
-  const DEFAULT_RESERVE = 300;
-  const MIN_BUDGET = 120;
+  const VERSION = "v8";
 
   if (customElements.get(TAG)) {
     console.log(LOG, TAG, "already defined, skipping (" + VERSION + ")");
@@ -101,11 +98,11 @@
   const template = document.createElement("template");
   template.innerHTML = `
     <style>
-      /* Content-sized, but capped by a max-width budget set from JS */
-      :host { display:inline-block; overflow:hidden; vertical-align:middle; }
+      :host { display:inline-block; overflow:hidden; vertical-align:middle; min-width:0; }
 
       .qt-root { display:inline-flex; align-items:center; gap:8px; padding:10px; width:max-content; box-sizing:border-box; }
       .qt-buttons { display:flex; flex-wrap:nowrap; gap:8px; align-items:center; }
+      .qt-buttons:empty { display:none; }
       .qt-button {
         background:var(--qt-bg, #007AA3); color:var(--qt-fg, #fff);
         border:none; border-radius:6px; padding:10px 14px; font-size:14px;
@@ -125,7 +122,7 @@
       :host([compact]) .qt-root { height:100%; padding:0; gap:6px; }
       :host([compact]) .qt-buttons { gap:6px; }
       :host([compact]) .qt-button { height:32px; padding:0 12px; font-size:13px; line-height:1; }
-      :host([compact]) .qt-more { height:32px; padding:0 6px; font-size:13px; }
+      :host([compact]) .qt-more { height:32px; padding:0 6px; font-size:13px; max-width:96px; }
       :host([compact]) #status { display:none; }
 
       /* ---------- two rows inside the header ---------- */
@@ -133,6 +130,7 @@
         display:grid; grid-template-rows:repeat(2, 24px);
         grid-auto-flow:column; grid-auto-columns:max-content; gap:3px 6px;
       }
+      :host([compact][data-rows="2"]) .qt-buttons:empty { display:none; }
       :host([compact][data-rows="2"]) .qt-button { height:24px; padding:0 10px; font-size:11.5px; border-radius:4px; }
     </style>
     <div class="qt-root" id="root">
@@ -146,7 +144,7 @@
   // Widget
   // ---------------------------------------------------------------------------
   class QuickTransfersWidget extends HTMLElement {
-    static get observedAttributes() { return ["data-buttons", "data-max-visible", "data-rows", "data-reserve", "compact"]; }
+    static get observedAttributes() { return ["data-buttons", "data-max-visible", "data-rows", "compact"]; }
 
     constructor() {
       super();
@@ -171,7 +169,6 @@
                       "eAgentContactWrappedUp", "eAgentOfferContact", "eAgentWrapup"];
     }
 
-    // Layout "properties" may be set before this script loads; re-apply them
     _upgradeProperty(p) {
       if (Object.prototype.hasOwnProperty.call(this, p)) {
         const v = this[p]; delete this[p]; this[p] = v;
@@ -198,12 +195,11 @@
       this._upgradeProperty("maxVisible");
       window.addEventListener("resize", this._onResize); // also fires on browser zoom
 
-      // Re-fit whenever the wrapper's width changes (header settling, other widgets loading)
       const parent = this.parentElement;
       if (parent && typeof ResizeObserver === "function") {
         this._ro = new ResizeObserver(entries => {
           const w = Math.round(entries[0].contentRect.width);
-          if (Math.abs(w - this._lastParentWidth) < 2) return; // ignore our own jitter
+          if (Math.abs(w - this._lastParentWidth) < 2) return;
           this._lastParentWidth = w;
           this._scheduleFit();
         });
@@ -211,7 +207,7 @@
       }
 
       this._fit();
-      setTimeout(() => this._scheduleFit(), 500);   // safety net once the header has settled
+      setTimeout(() => this._scheduleFit(), 500);
       setTimeout(() => this._scheduleFit(), 2000);
       this.start();
     }
@@ -247,19 +243,16 @@
       return this.getAttribute("data-rows") === "2" ? 10 : 5;
     }
 
-    // Width budget = real inner width of the wrapper. Falls back to window - reserve.
+    // Inner width of the wrapper. Returns null if it hasn't laid out yet.
+    // No window-based fallback: that caused the widget to overflow the header.
     _getBudget() {
       const parent = this.parentElement;
-      if (parent) {
-        const cs = getComputedStyle(parent);
-        const inner = parent.clientWidth
-          - (parseFloat(cs.paddingLeft) || 0)
-          - (parseFloat(cs.paddingRight) || 0);
-        if (inner >= MIN_BUDGET) return { budget: Math.floor(inner), source: "container" };
-      }
-      const r = parseInt(this.getAttribute("data-reserve"), 10);
-      const reserve = isNaN(r) ? DEFAULT_RESERVE : Math.max(0, r);
-      return { budget: Math.max(MIN_BUDGET, window.innerWidth - reserve), source: "window" };
+      if (!parent || parent.clientWidth === 0) return null;
+      const cs = getComputedStyle(parent);
+      const inner = parent.clientWidth
+        - (parseFloat(cs.paddingLeft) || 0)
+        - (parseFloat(cs.paddingRight) || 0);
+      return Math.max(0, Math.floor(inner));
     }
 
     _escape(s = "") {
@@ -273,7 +266,6 @@
       return { bg, fg };
     }
 
-    // Finds the largest number of visible buttons that fits the width budget
     _fit() {
       this._list = this._getList();
       if (!this._list.length) {
@@ -282,10 +274,16 @@
         return;
       }
 
-      const max = Math.min(this._getMaxVisible(), this._list.length);
-      const { budget, source } = this._getBudget();
-      this.style.maxWidth = budget + "px";
+      const budget = this._getBudget();
+      if (budget === null) {
+        // Not laid out yet: show only "More…" and wait for the ResizeObserver
+        this.style.maxWidth = "";
+        this._render(0);
+        return;
+      }
 
+      const max = Math.min(this._getMaxVisible(), this._list.length);
+      this.style.maxWidth = budget + "px";
       const fits = () => this._root.scrollWidth <= budget;
 
       let best = max;
@@ -298,14 +296,13 @@
           this._render(mid);
           if (fits()) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
         }
-        this._render(best);
+        this._render(best); // best may be 0: "More…" still renders
       }
 
-      const msg = `fit: budget ${budget}px (${source}, window ${window.innerWidth}px) → ${best}/${this._list.length} buttons`;
+      const msg = `fit: budget ${budget}px (window ${window.innerWidth}px, zoom ~${Math.round(window.devicePixelRatio * 100)}%) → ${best}/${this._list.length} buttons`;
       if (msg !== this._lastLog) { console.log(LOG, msg); this._lastLog = msg; }
     }
 
-    // Renders the first n entries as buttons and the rest in the "More…" dropdown
     _render(n) {
       const visible = this._list.slice(0, n);
       const overflow = this._list.slice(n).map((b, j) => ({ b, idx: n + j }));
@@ -343,7 +340,7 @@
 
         this._moreDiv.innerHTML =
           `<select class="qt-more qt-ctl" title="More transfer destinations">
-             <option value="" selected>More… (${overflow.length})</option>${inner}
+             <option value="" selected>More (${overflow.length})</option>${inner}
            </select>`;
         const sel = this._moreDiv.querySelector("select");
         sel.addEventListener("change", () => {
