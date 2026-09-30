@@ -1,5 +1,5 @@
 // quick-transfers.js — Quick Transfers header widget (no build step required)
-// Registers <agentx-qt-transfers-widget-v10>. ALL configuration lives in the desktop layout JSON.
+// Registers <agentx-qt-transfers-widget-v11>. ALL configuration lives in the desktop layout JSON.
 //
 // Layout "properties":
 //   buttons     Array of { label, dest, color?, textColor?, group? }
@@ -10,15 +10,22 @@
 //   data-max-visible  Same as maxVisible
 //   data-rows         "1" (default) or "2" = two rows of smaller buttons in the header
 //   data-confirm      "true" = ask "Transfer to X?" before transferring
-//   data-reserve      Pixels reserved for the other header items (default 700).
+//   data-reserve      Starting guess (px) for the other header items (default 700).
+//                     v11 raises this automatically if the desktop collapses us into "...".
 //   compact           Header mode
 //
-// How sizing works (v10):
-//   - Button widths are CALCULATED from label text (canvas), never measured from the DOM.
-//     This gives the same answer whether we're visible, hidden, in the header or in a menu.
-//   - Header mode: budget = window.innerWidth - data-reserve - SAFETY.
-//   - Menu mode: if the desktop moves us out of the header (its "..." overflow menu),
-//     we render a vertical list of all destinations instead of rows going off-screen.
+// Sizing (v11):
+//   - Button widths are estimated from label text (canvas), then verified against the
+//     real rendered width whenever we're visible in the header.
+//   - Budget = window.innerWidth - max(data-reserve, learned reserve) - SAFETY.
+//   - Self-calibration: if the desktop moves us into its "..." menu right after a header
+//     fit, we learn a larger reserve (stored in localStorage) so next time we show
+//     "More + fewer buttons" instead of disappearing.
+//   - Menu mode: inside the "..." menu we render a vertical, scrollable list.
+//
+// Debug in the console:
+//   QuickTransfersDebug.learned()   -> current learned reserves
+//   QuickTransfersDebug.reset()     -> forget learned reserves
 //
 // NOTE: The tag name carries the version. When you ship a change, bump
 // TAG + VERSION here AND "comp" + "?v=" in the layout.
@@ -26,16 +33,67 @@
 (function () {
   "use strict";
 
-  const TAG = "agentx-qt-transfers-widget-v10";
+  const TAG = "agentx-qt-transfers-widget-v11";
   const LOG = "[QuickTransfers]";
-  const VERSION = "v10";
+  const VERSION = "v11";
   const DEFAULT_RESERVE = 700;
-  const SAFETY = 24;            // extra px kept free so the desktop never sees an overflowing header
-  const HEADER_MAX_TOP = 40;    // wrapper top (px) below which we consider ourselves "in the header"
+  const SAFETY = 24;             // extra px kept free on every fit
+  const HEADER_MAX_TOP = 40;     // wrapper top (px) below which we count as "in the header"
+  const LEARN_MARGIN = 40;       // extra px added when learning from a collapse
+  const LEARN_WINDOW_MS = 3000;  // a collapse this soon after a header fit counts
+  const LEARN_CONFIRM_MS = 400;  // wait before confirming we're really in the menu
+  const MAX_LEARNED = 1400;      // never learn a reserve larger than this
+  const LS_PREFIX = "qt-learned-reserve:";
 
   if (customElements.get(TAG)) {
     console.log(LOG, TAG, "already defined, skipping (" + VERSION + ")");
     return;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Shared state (survives the desktop's remounts)
+  // ---------------------------------------------------------------------------
+  const instances = new Set();
+  let lastHeaderFit = null;      // { win, width, n, t, base }
+
+  function readLearned(base) {
+    try { return parseInt(localStorage.getItem(LS_PREFIX + base), 10) || 0; } catch (e) { return 0; }
+  }
+  function writeLearned(base, v) {
+    try { localStorage.setItem(LS_PREFIX + base, String(v)); } catch (e) {}
+  }
+
+  window.QuickTransfersDebug = {
+    learned() {
+      const out = {};
+      try {
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          if (k && k.startsWith(LS_PREFIX)) out[k.slice(LS_PREFIX.length)] = localStorage.getItem(k);
+        }
+      } catch (e) {}
+      return out;
+    },
+    reset() {
+      try {
+        Object.keys(this.learned()).forEach(b => localStorage.removeItem(LS_PREFIX + b));
+      } catch (e) {}
+      instances.forEach(w => { w._renderedKey = ""; w._fit(); });
+      console.log(LOG, "learned reserves cleared");
+    }
+  };
+
+  function learnFrom(cand) {
+    const current = Math.max(cand.base, readLearned(cand.base));
+    const need = Math.ceil(cand.win - cand.width + LEARN_MARGIN);
+    if (need <= current) return;
+    if (need > MAX_LEARNED) {
+      console.log(LOG, `collapse at window ${cand.win}px would need reserve ${need}px (> cap ${MAX_LEARNED}); the desktop is collapsing at this size regardless`);
+      return;
+    }
+    writeLearned(cand.base, need);
+    console.log(LOG, `desktop collapsed us at window ${cand.win}px (widget ${cand.width}px) → learned reserve ${need}px (was ${current}px)`);
+    instances.forEach(w => { w._renderedKey = ""; w._fit(); });
   }
 
   // ---------------------------------------------------------------------------
@@ -64,7 +122,6 @@
     return (0.299 * r + 0.587 * g + 0.114 * b) > 160 ? "#000" : "#fff";
   }
 
-  // Shared canvas for text measurement (works without layout)
   const measureCtx = document.createElement("canvas").getContext("2d");
 
   // ---------------------------------------------------------------------------
@@ -146,7 +203,7 @@
       :host([compact][data-rows="2"]) .qt-buttons:empty { display:none; }
       :host([compact][data-rows="2"]) .qt-button { height:24px; padding:0 10px; font-size:11.5px; border-radius:4px; }
 
-      /* ---------- menu mode: we're inside the desktop's "..." overflow menu ---------- */
+      /* ---------- menu mode: inside the desktop's "..." overflow menu ---------- */
       :host([data-mode="list"]) { display:block !important; height:auto !important; max-width:none !important; overflow:visible !important; }
       :host([data-mode="list"]) .qt-root {
         display:flex !important; flex-direction:column; align-items:stretch;
@@ -200,7 +257,6 @@
                       "eAgentContactWrappedUp", "eAgentOfferContact", "eAgentWrapup"];
     }
 
-    // Layout "properties" may be set before this script loads; re-apply them
     _upgradeProperty(p) {
       if (Object.prototype.hasOwnProperty.call(this, p)) {
         const v = this[p]; delete this[p]; this[p] = v;
@@ -225,13 +281,12 @@
     attributeChangedCallback() { this._renderedKey = ""; if (this.isConnected) this._scheduleFit(); }
 
     connectedCallback() {
+      instances.add(this);
       this._upgradeProperty("buttons");
       this._upgradeProperty("maxVisible");
       this._renderedKey = "";
-      window.addEventListener("resize", this._onResize); // window resize AND browser zoom
+      window.addEventListener("resize", this._onResize);
 
-      // Detect moves between header and "..." menu (show/hide, re-parenting).
-      // Safe from loops: the fit result doesn't depend on our own measured size.
       if (typeof ResizeObserver === "function") {
         this._ro = new ResizeObserver(() => this._scheduleFit());
         this._ro.observe(this);
@@ -246,6 +301,7 @@
     }
 
     disconnectedCallback() {
+      instances.delete(this);
       window.removeEventListener("resize", this._onResize);
       if (this._ro) { this._ro.disconnect(); this._ro = null; }
       if (this._raf) { cancelAnimationFrame(this._raf); this._raf = null; }
@@ -276,22 +332,28 @@
       return this.getAttribute("data-rows") === "2" ? 10 : 5;
     }
 
-    _getBudget() {
+    _baseReserve() {
       const r = parseInt(this.getAttribute("data-reserve"), 10);
-      const reserve = isNaN(r) ? DEFAULT_RESERVE : Math.max(0, r);
-      return Math.max(0, Math.floor(window.innerWidth - reserve - SAFETY));
+      return isNaN(r) ? DEFAULT_RESERVE : Math.max(0, r);
     }
 
-    // "header" = sitting in the top bar; "menu" = inside the desktop's overflow menu or hidden
+    _getReserve() {
+      const base = this._baseReserve();
+      return Math.max(base, readLearned(base));
+    }
+
+    _getBudget() {
+      return Math.max(0, Math.floor(window.innerWidth - this._getReserve() - SAFETY));
+    }
+
     _placement() {
       const p = this.parentElement;
       if (!p) return "menu";
       const r = p.getBoundingClientRect();
-      if (r.width === 0 && r.height === 0) return "menu";   // hidden (closed "..." menu)
+      if (r.width === 0 && r.height === 0) return "menu";
       return r.top < HEADER_MAX_TOP ? "header" : "menu";
     }
 
-    // In menu mode, lift the wrapper's 56px clip so the vertical list is visible
     _setParentClip(clip) {
       const p = this.parentElement;
       if (!p) return;
@@ -307,7 +369,6 @@
       }
     }
 
-    // Geometry must match the CSS above
     _geom() {
       const compact = this.hasAttribute("compact");
       const rows2 = compact && this.getAttribute("data-rows") === "2";
@@ -322,7 +383,6 @@
       return this._list.map(b => Math.ceil(measureCtx.measureText(String(b.label)).width) + g.pad + 2);
     }
 
-    // Total header width needed to show the first n buttons (+ "More" if anything overflows)
     _widthFor(n, g, widths) {
       let w = 0, cols = 0;
       for (let i = 0; i < n; i += g.rows) {
@@ -346,6 +406,13 @@
       return { bg, fg };
     }
 
+    _renderIfChanged(key, n) {
+      if (key !== this._renderedKey) {
+        this._render(n);
+        this._renderedKey = key;
+      }
+    }
+
     _fit() {
       this._list = this._getList();
       if (!this._list.length) {
@@ -356,40 +423,62 @@
       }
 
       const place = this._placement();
-      let n, budget = null;
 
       if (place === "menu") {
         this.setAttribute("data-mode", "list");
         this.style.maxWidth = "";
         this._setParentClip(false);
-        n = this._list.length;                       // show everything as a vertical list
-      } else {
-        this.removeAttribute("data-mode");
-        this._setParentClip(true);
-        const g = this._geom();
-        const widths = this._buttonWidths(g);
-        budget = this._getBudget();
-        const max = Math.min(this._getMaxVisible(), this._list.length);
-        n = 0;
-        for (let k = max; k >= 0; k--) {
-          if (this._widthFor(k, g, widths) <= budget) { n = k; break; }
+        const n = this._list.length;
+        this._renderIfChanged("menu:" + n, n);
+
+        // Did the desktop just collapse us? Confirm, then learn a bigger reserve.
+        if (lastHeaderFit && performance.now() - lastHeaderFit.t < LEARN_WINDOW_MS) {
+          const cand = lastHeaderFit;
+          lastHeaderFit = null;
+          setTimeout(() => {
+            const all = [...instances];
+            if (all.length && all.every(w => w._placement() === "menu")) learnFrom(cand);
+          }, LEARN_CONFIRM_MS);
         }
-        this.style.maxWidth = Math.max(budget, g.moreW) + "px";
+
+        const msg = `fit: mode=menu (vertical list, ${n} items)`;
+        if (msg !== this._lastLog) { console.log(LOG, msg); this._lastLog = msg; }
+        return;
       }
 
-      const key = place + ":" + n;
-      if (key !== this._renderedKey) {               // only touch the DOM when something changed
-        this._render(n);
-        this._renderedKey = key;
+      // ---- header mode ----
+      this.removeAttribute("data-mode");
+      this._setParentClip(true);
+      const g = this._geom();
+      const widths = this._buttonWidths(g);
+      const budget = this._getBudget();
+      const max = Math.min(this._getMaxVisible(), this._list.length);
+      this.style.maxWidth = Math.max(budget, g.moreW) + "px";
+
+      let n = 0;
+      for (let k = max; k >= 0; k--) {
+        if (this._widthFor(k, g, widths) <= budget) { n = k; break; }
+      }
+      this._renderIfChanged("header:" + n, n);
+
+      // Verify against the real rendered width (only meaningful while visible)
+      let width = this._widthFor(n, g, widths);
+      if (this._root.getBoundingClientRect().width > 0) {
+        let real = this._root.scrollWidth;
+        while (real > budget && n > 0) {
+          n--;
+          this._renderIfChanged("header:" + n, n);
+          real = this._root.scrollWidth;
+        }
+        width = real;
       }
 
-      const msg = place === "menu"
-        ? `fit: mode=menu (vertical list, ${n} items)`
-        : `fit: mode=header window ${window.innerWidth}px → budget ${budget}px → ${n}/${this._list.length} buttons`;
+      lastHeaderFit = { win: window.innerWidth, width, n, t: performance.now(), base: this._baseReserve() };
+
+      const msg = `fit: mode=header window ${window.innerWidth}px, reserve ${this._getReserve()}px → budget ${budget}px → ${n}/${this._list.length} buttons (${width}px)`;
       if (msg !== this._lastLog) { console.log(LOG, msg); this._lastLog = msg; }
     }
 
-    // Renders the first n entries as buttons and the rest in the "More" dropdown
     _render(n) {
       const visible = this._list.slice(0, n);
       const overflow = this._list.slice(n).map((b, j) => ({ b, idx: n + j }));
