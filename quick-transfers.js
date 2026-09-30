@@ -2,10 +2,11 @@
 // Registers <agentx-qt-transfers-widget>. ALL configuration lives in the desktop layout JSON.
 //
 // Layout "properties":
-//   buttons     Array of { label, dest, color?, group? }   (preferred, no escaping needed)
-//   maxVisible  Number of real buttons; the rest go into the "More…" dropdown
+//   buttons     Array of { label, dest, color?, textColor?, group? }
+//   maxVisible  Max number of real buttons; the rest go into the "More…" dropdown.
+//               Buttons that don't fit the available width also move into "More…" automatically.
 //
-// Layout "attributes" (alternatives / extras):
+// Layout "attributes":
 //   data-buttons      Same array as an escaped JSON string (fallback)
 //   data-max-visible  Same as maxVisible
 //   data-rows         "1" (default) or "2" = two rows of smaller buttons in the header
@@ -17,7 +18,7 @@
 
   const TAG = "agentx-qt-transfers-widget";
   const LOG = "[QuickTransfers]";
-  const VERSION = "v4";
+  const VERSION = "v5";
 
   if (customElements.get(TAG)) return;
 
@@ -89,9 +90,12 @@
   const template = document.createElement("template");
   template.innerHTML = `
     <style>
-      :host { display:block; }
-      .qt-root { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:10px; }
-      .qt-buttons { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+      /* The host takes the space it is given and never forces the header wider */
+      :host { display:block; flex:1 1 0; min-width:0; max-width:100%; overflow:hidden; }
+
+      /* The inner row is sized to its content so it can be measured */
+      .qt-root { display:inline-flex; align-items:center; gap:8px; padding:10px; width:max-content; box-sizing:border-box; }
+      .qt-buttons { display:flex; flex-wrap:nowrap; gap:8px; align-items:center; }
       .qt-button {
         background:var(--qt-bg, #007AA3); color:var(--qt-fg, #fff);
         border:none; border-radius:6px; padding:10px 14px; font-size:14px;
@@ -100,28 +104,28 @@
       .qt-button:hover:not(:disabled) { filter:brightness(0.88); }
       .qt-button:disabled { opacity:.4; cursor:not-allowed; }
       .qt-more {
-        padding:8px; border-radius:6px; border:1px solid #007AA3; background:#fff;
-        color:#005F7A; font-size:14px; cursor:pointer; max-width:220px;
+        flex:0 0 auto; padding:8px; border-radius:6px; border:1px solid #007AA3; background:#fff;
+        color:#005F7A; font-size:14px; cursor:pointer; max-width:160px;
       }
       .qt-more:disabled { opacity:.5; cursor:not-allowed; }
-      #status { font-size:12px; color:#666; width:100%; }
+      #status { font-size:12px; color:#666; white-space:nowrap; }
 
       /* ---------- compact / header mode ---------- */
-      :host([compact]) { display:flex; align-items:center; height:100%; }
-      :host([compact]) .qt-root { flex-wrap:nowrap; padding:0; gap:6px; height:100%; }
-      :host([compact]) .qt-buttons { flex-wrap:nowrap; gap:6px; }
+      :host([compact]) { height:100%; }
+      :host([compact]) .qt-root { height:100%; padding:0; gap:6px; }
+      :host([compact]) .qt-buttons { gap:6px; }
       :host([compact]) .qt-button { height:32px; padding:0 12px; font-size:13px; line-height:1; }
-      :host([compact]) .qt-more { height:32px; padding:0 8px; font-size:13px; }
+      :host([compact]) .qt-more { height:32px; padding:0 6px; font-size:13px; }
       :host([compact]) #status { display:none; }
 
       /* ---------- two rows inside the header ---------- */
       :host([compact][data-rows="2"]) .qt-buttons {
         display:grid; grid-template-rows:repeat(2, 24px);
-        grid-auto-flow:column; gap:3px 6px;
+        grid-auto-flow:column; grid-auto-columns:max-content; gap:3px 6px;
       }
       :host([compact][data-rows="2"]) .qt-button { height:24px; padding:0 10px; font-size:11.5px; border-radius:4px; }
     </style>
-    <div class="qt-root">
+    <div class="qt-root" id="root">
       <div class="qt-buttons" id="btns"></div>
       <div id="more"></div>
       <div id="status">Starting…</div>
@@ -132,12 +136,13 @@
   // Widget
   // ---------------------------------------------------------------------------
   class QuickTransfersWidget extends HTMLElement {
-    static get observedAttributes() { return ["data-buttons", "data-max-visible", "data-rows"]; }
+    static get observedAttributes() { return ["data-buttons", "data-max-visible", "data-rows", "compact"]; }
 
     constructor() {
       super();
       this.attachShadow({ mode: "open" });
       this.shadowRoot.appendChild(template.content.cloneNode(true));
+      this._root = this.shadowRoot.getElementById("root");
       this._btnsDiv = this.shadowRoot.getElementById("btns");
       this._moreDiv = this.shadowRoot.getElementById("more");
       this._statusEl = this.shadowRoot.getElementById("status");
@@ -146,6 +151,9 @@
       this._busy = false;
       this._D = null;
       this._poll = null;
+      this._ro = null;
+      this._raf = null;
+      this._lastWidth = -1;
       this._boundUpdate = this.updateButtons.bind(this);
       this._events = ["eAgentContact", "eAgentContactAssigned", "eAgentContactEnded",
                       "eAgentContactWrappedUp", "eAgentOfferContact", "eAgentWrapup"];
@@ -162,30 +170,52 @@
     set buttons(v) {
       if (typeof v === "string") { try { v = JSON.parse(v); } catch (e) { v = null; } }
       this._buttonsProp = Array.isArray(v) ? v : null;
-      if (this.isConnected) this.renderButtons();
+      if (this.isConnected) this._fit();
     }
     get maxVisible() { return this._maxVisibleProp; }
     set maxVisible(v) {
       const n = parseInt(v, 10);
       this._maxVisibleProp = isNaN(n) ? undefined : n;
-      if (this.isConnected) this.renderButtons();
+      if (this.isConnected) this._fit();
     }
 
-    attributeChangedCallback() { if (this.isConnected) this.renderButtons(); }
+    attributeChangedCallback() { if (this.isConnected) this._scheduleFit(); }
 
     connectedCallback() {
       this._upgradeProperty("buttons");
       this._upgradeProperty("maxVisible");
-      this.renderButtons();
+      this._fit();
+
+      // Re-fit whenever the space available to the widget changes (resize, zoom, etc.)
+      if (window.ResizeObserver) {
+        this._ro = new ResizeObserver(() => {
+          const w = Math.round(this.clientWidth);
+          if (w !== this._lastWidth) {
+            this._lastWidth = w;
+            this._scheduleFit();
+          }
+        });
+        this._ro.observe(this);
+      } else {
+        window.addEventListener("resize", () => this._scheduleFit());
+      }
+
       this.start();
     }
 
     disconnectedCallback() {
+      if (this._ro) { this._ro.disconnect(); this._ro = null; }
+      if (this._raf) { cancelAnimationFrame(this._raf); this._raf = null; }
       clearInterval(this._poll);
       const D = this._D;
       if (D && D.agentContact && D.agentContact.removeEventListener) {
         this._events.forEach(evt => { try { D.agentContact.removeEventListener(evt, this._boundUpdate); } catch (e) {} });
       }
+    }
+
+    _scheduleFit() {
+      if (this._raf) return;
+      this._raf = requestAnimationFrame(() => { this._raf = null; this._fit(); });
     }
 
     _getList() {
@@ -214,7 +244,8 @@
       return { bg, fg };
     }
 
-    renderButtons() {
+    // Finds the largest number of visible buttons that fits the available width
+    _fit() {
       this._list = this._getList();
       if (!this._list.length) {
         this._btnsDiv.innerHTML = `<div style="color:#666">No destinations configured</div>`;
@@ -222,11 +253,32 @@
         return;
       }
 
-      const max = this._getMaxVisible();
-      const visible = this._list.slice(0, max);
-      const overflow = this._list.slice(max).map((b, j) => ({ b, idx: max + j }));
+      const max = Math.min(this._getMaxVisible(), this._list.length);
+      const avail = this.clientWidth;
 
-      // Buttons
+      // Not laid out yet (hidden or still loading): render everything, re-fit on resize
+      if (!avail) { this._render(max); return; }
+
+      const fits = () => this._root.offsetWidth <= avail + 1;
+
+      this._render(max);
+      if (fits()) return;
+
+      // Binary search for the largest count that fits
+      let lo = 0, hi = max - 1, best = 0;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        this._render(mid);
+        if (fits()) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
+      }
+      this._render(best);
+    }
+
+    // Renders the first n entries as buttons and the rest in the "More…" dropdown
+    _render(n) {
+      const visible = this._list.slice(0, n);
+      const overflow = this._list.slice(n).map((b, j) => ({ b, idx: n + j }));
+
       this._btnsDiv.innerHTML = visible.map((b, i) => {
         const { bg, fg } = this._colorStyle(b);
         return `<button class="qt-button qt-ctl" data-idx="${i}"
@@ -240,7 +292,6 @@
         });
       });
 
-      // "More…" dropdown (optionally grouped)
       if (overflow.length) {
         const opt = ({ b, idx }) => {
           const { bg, fg } = this._colorStyle(b);
