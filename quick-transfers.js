@@ -1,5 +1,5 @@
 // quick-transfers.js — Quick Transfers header widget (no build step required)
-// Registers <agentx-qt-transfers-widget-v9>. ALL configuration lives in the desktop layout JSON.
+// Registers <agentx-qt-transfers-widget-v10>. ALL configuration lives in the desktop layout JSON.
 //
 // Layout "properties":
 //   buttons     Array of { label, dest, color?, textColor?, group? }
@@ -11,13 +11,14 @@
 //   data-rows         "1" (default) or "2" = two rows of smaller buttons in the header
 //   data-confirm      "true" = ask "Transfer to X?" before transferring
 //   data-reserve      Pixels reserved for the other header items (default 700).
-//                     Width budget = window.innerWidth - data-reserve.
-//                     Raise it if buttons vanish into the desktop's "..." menu;
-//                     lower it if there's empty space while buttons sit in "More".
 //   compact           Header mode
 //
-// The budget is computed from the window only, never from the parent element.
-// Measuring the parent created a feedback loop (parent width depends on our width).
+// How sizing works (v10):
+//   - Button widths are CALCULATED from label text (canvas), never measured from the DOM.
+//     This gives the same answer whether we're visible, hidden, in the header or in a menu.
+//   - Header mode: budget = window.innerWidth - data-reserve - SAFETY.
+//   - Menu mode: if the desktop moves us out of the header (its "..." overflow menu),
+//     we render a vertical list of all destinations instead of rows going off-screen.
 //
 // NOTE: The tag name carries the version. When you ship a change, bump
 // TAG + VERSION here AND "comp" + "?v=" in the layout.
@@ -25,11 +26,12 @@
 (function () {
   "use strict";
 
-  const TAG = "agentx-qt-transfers-widget-v9";
+  const TAG = "agentx-qt-transfers-widget-v10";
   const LOG = "[QuickTransfers]";
-  const VERSION = "v9";
+  const VERSION = "v10";
   const DEFAULT_RESERVE = 700;
-  const MORE_ONLY_WIDTH = 110; // below this budget, show only the "More" dropdown
+  const SAFETY = 24;            // extra px kept free so the desktop never sees an overflowing header
+  const HEADER_MAX_TOP = 40;    // wrapper top (px) below which we consider ourselves "in the header"
 
   if (customElements.get(TAG)) {
     console.log(LOG, TAG, "already defined, skipping (" + VERSION + ")");
@@ -61,6 +63,9 @@
     const r = parseInt(h.slice(0, 2), 16), g = parseInt(h.slice(2, 4), 16), b = parseInt(h.slice(4, 6), 16);
     return (0.299 * r + 0.587 * g + 0.114 * b) > 160 ? "#000" : "#fff";
   }
+
+  // Shared canvas for text measurement (works without layout)
+  const measureCtx = document.createElement("canvas").getContext("2d");
 
   // ---------------------------------------------------------------------------
   // SDK loading (shared by all instances)
@@ -112,13 +117,15 @@
       .qt-button {
         background:var(--qt-bg, #007AA3); color:var(--qt-fg, #fff);
         border:none; border-radius:6px; padding:10px 14px; font-size:14px;
+        font-family:inherit; font-weight:400; letter-spacing:normal;
         cursor:pointer; white-space:nowrap; transition:filter .15s ease, opacity .15s ease;
+        box-sizing:border-box;
       }
       .qt-button:hover:not(:disabled) { filter:brightness(0.88); }
       .qt-button:disabled { opacity:.4; cursor:not-allowed; }
       .qt-more {
         flex:0 0 auto; padding:8px; border-radius:6px; border:1px solid #007AA3; background:#fff;
-        color:#005F7A; font-size:14px; cursor:pointer; max-width:160px;
+        color:#005F7A; font-size:14px; font-family:inherit; cursor:pointer; width:130px; box-sizing:border-box;
       }
       .qt-more:disabled { opacity:.5; cursor:not-allowed; }
       #status { font-size:12px; color:#666; white-space:nowrap; }
@@ -128,7 +135,7 @@
       :host([compact]) .qt-root { height:100%; padding:0; gap:6px; }
       :host([compact]) .qt-buttons { gap:6px; }
       :host([compact]) .qt-button { height:32px; padding:0 12px; font-size:13px; line-height:1; }
-      :host([compact]) .qt-more { height:32px; padding:0 6px; font-size:13px; max-width:96px; }
+      :host([compact]) .qt-more { height:32px; padding:0 6px; font-size:13px; width:96px; }
       :host([compact]) #status { display:none; }
 
       /* ---------- two rows inside the header ---------- */
@@ -138,6 +145,23 @@
       }
       :host([compact][data-rows="2"]) .qt-buttons:empty { display:none; }
       :host([compact][data-rows="2"]) .qt-button { height:24px; padding:0 10px; font-size:11.5px; border-radius:4px; }
+
+      /* ---------- menu mode: we're inside the desktop's "..." overflow menu ---------- */
+      :host([data-mode="list"]) { display:block !important; height:auto !important; max-width:none !important; overflow:visible !important; }
+      :host([data-mode="list"]) .qt-root {
+        display:flex !important; flex-direction:column; align-items:stretch;
+        width:auto !important; height:auto !important; padding:6px 0 !important;
+      }
+      :host([data-mode="list"]) .qt-buttons {
+        display:flex !important; flex-direction:column !important; align-items:stretch;
+        gap:4px !important; max-height:60vh; overflow-y:auto; min-width:160px;
+      }
+      :host([data-mode="list"]) .qt-button {
+        width:100%; height:28px !important; padding:0 12px !important;
+        font-size:13px !important; text-align:left; border-radius:4px;
+      }
+      :host([data-mode="list"]) #more,
+      :host([data-mode="list"]) #status { display:none !important; }
     </style>
     <div class="qt-root" id="root">
       <div class="qt-buttons" id="btns"></div>
@@ -166,8 +190,11 @@
       this._D = null;
       this._poll = null;
       this._raf = null;
+      this._ro = null;
+      this._parentOrig = null;
+      this._renderedKey = "";
       this._lastLog = "";
-      this._onResize = () => this._scheduleFit();
+      this._onResize = () => this._fit();            // synchronous: no frame of lag
       this._boundUpdate = this.updateButtons.bind(this);
       this._events = ["eAgentContact", "eAgentContactAssigned", "eAgentContactEnded",
                       "eAgentContactWrappedUp", "eAgentOfferContact", "eAgentWrapup"];
@@ -184,29 +211,43 @@
     set buttons(v) {
       if (typeof v === "string") { try { v = JSON.parse(v); } catch (e) { v = null; } }
       this._buttonsProp = Array.isArray(v) ? v : null;
+      this._renderedKey = "";
       if (this.isConnected) this._scheduleFit();
     }
     get maxVisible() { return this._maxVisibleProp; }
     set maxVisible(v) {
       const n = parseInt(v, 10);
       this._maxVisibleProp = isNaN(n) ? undefined : n;
+      this._renderedKey = "";
       if (this.isConnected) this._scheduleFit();
     }
 
-    attributeChangedCallback() { if (this.isConnected) this._scheduleFit(); }
+    attributeChangedCallback() { this._renderedKey = ""; if (this.isConnected) this._scheduleFit(); }
 
     connectedCallback() {
       this._upgradeProperty("buttons");
       this._upgradeProperty("maxVisible");
-      window.addEventListener("resize", this._onResize); // fires on window resize AND browser zoom
+      this._renderedKey = "";
+      window.addEventListener("resize", this._onResize); // window resize AND browser zoom
+
+      // Detect moves between header and "..." menu (show/hide, re-parenting).
+      // Safe from loops: the fit result doesn't depend on our own measured size.
+      if (typeof ResizeObserver === "function") {
+        this._ro = new ResizeObserver(() => this._scheduleFit());
+        this._ro.observe(this);
+        if (this.parentElement) this._ro.observe(this.parentElement);
+      }
+
       this._fit();
-      setTimeout(() => this._scheduleFit(), 500);   // re-fit once fonts/header have settled
+      if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { this._renderedKey = ""; this._scheduleFit(); });
+      setTimeout(() => this._scheduleFit(), 500);
       setTimeout(() => this._scheduleFit(), 2000);
       this.start();
     }
 
     disconnectedCallback() {
       window.removeEventListener("resize", this._onResize);
+      if (this._ro) { this._ro.disconnect(); this._ro = null; }
       if (this._raf) { cancelAnimationFrame(this._raf); this._raf = null; }
       clearInterval(this._poll);
       const D = this._D;
@@ -235,11 +276,63 @@
       return this.getAttribute("data-rows") === "2" ? 10 : 5;
     }
 
-    // Budget comes from the window only, never from our parent (avoids the feedback loop)
     _getBudget() {
       const r = parseInt(this.getAttribute("data-reserve"), 10);
       const reserve = isNaN(r) ? DEFAULT_RESERVE : Math.max(0, r);
-      return Math.max(0, Math.floor(window.innerWidth - reserve));
+      return Math.max(0, Math.floor(window.innerWidth - reserve - SAFETY));
+    }
+
+    // "header" = sitting in the top bar; "menu" = inside the desktop's overflow menu or hidden
+    _placement() {
+      const p = this.parentElement;
+      if (!p) return "menu";
+      const r = p.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) return "menu";   // hidden (closed "..." menu)
+      return r.top < HEADER_MAX_TOP ? "header" : "menu";
+    }
+
+    // In menu mode, lift the wrapper's 56px clip so the vertical list is visible
+    _setParentClip(clip) {
+      const p = this.parentElement;
+      if (!p) return;
+      if (!this._parentOrig) this._parentOrig = { mh: p.style.maxHeight, ov: p.style.overflow, h: p.style.height };
+      if (clip) {
+        p.style.maxHeight = this._parentOrig.mh;
+        p.style.overflow = this._parentOrig.ov;
+        p.style.height = this._parentOrig.h;
+      } else {
+        p.style.maxHeight = "none";
+        p.style.overflow = "visible";
+        p.style.height = "auto";
+      }
+    }
+
+    // Geometry must match the CSS above
+    _geom() {
+      const compact = this.hasAttribute("compact");
+      const rows2 = compact && this.getAttribute("data-rows") === "2";
+      if (rows2)   return { rows: 2, font: 11.5, pad: 20, gap: 6, moreW: 96,  rootPad: 0,  extra: 0 };
+      if (compact) return { rows: 1, font: 13,   pad: 24, gap: 6, moreW: 96,  rootPad: 0,  extra: 0 };
+      return              { rows: 1, font: 14,   pad: 28, gap: 8, moreW: 130, rootPad: 20, extra: 110 };
+    }
+
+    _buttonWidths(g) {
+      const family = getComputedStyle(this).fontFamily || "sans-serif";
+      measureCtx.font = `400 ${g.font}px ${family}`;
+      return this._list.map(b => Math.ceil(measureCtx.measureText(String(b.label)).width) + g.pad + 2);
+    }
+
+    // Total header width needed to show the first n buttons (+ "More" if anything overflows)
+    _widthFor(n, g, widths) {
+      let w = 0, cols = 0;
+      for (let i = 0; i < n; i += g.rows) {
+        let c = widths[i];
+        if (g.rows === 2 && i + 1 < n) c = Math.max(c, widths[i + 1]);
+        w += c; cols++;
+      }
+      if (cols > 1) w += (cols - 1) * g.gap;
+      if (n < this._list.length) w += (cols ? g.gap : 0) + g.moreW;
+      return w + g.rootPad + g.extra;
     }
 
     _escape(s = "") {
@@ -253,39 +346,46 @@
       return { bg, fg };
     }
 
-    // Finds the largest number of visible buttons that fits the width budget
     _fit() {
       this._list = this._getList();
       if (!this._list.length) {
         this._btnsDiv.innerHTML = `<div style="color:#666">No destinations configured</div>`;
         this._moreDiv.innerHTML = "";
+        this._renderedKey = "";
         return;
       }
 
-      const budget = this._getBudget();
-      this.style.maxWidth = Math.max(budget, MORE_ONLY_WIDTH) + "px";
-      const max = Math.min(this._getMaxVisible(), this._list.length);
-      let best = 0;
+      const place = this._placement();
+      let n, budget = null;
 
-      if (budget >= MORE_ONLY_WIDTH) {
-        // .qt-root is width:max-content, so scrollWidth is its intrinsic width,
-        // independent of whatever container the desktop puts us in
-        const fits = () => this._root.scrollWidth <= budget;
-        this._render(max);
-        if (fits()) {
-          best = max;
-        } else {
-          let lo = 0, hi = max - 1;
-          while (lo <= hi) {
-            const mid = (lo + hi) >> 1;
-            this._render(mid);
-            if (fits()) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
-          }
+      if (place === "menu") {
+        this.setAttribute("data-mode", "list");
+        this.style.maxWidth = "";
+        this._setParentClip(false);
+        n = this._list.length;                       // show everything as a vertical list
+      } else {
+        this.removeAttribute("data-mode");
+        this._setParentClip(true);
+        const g = this._geom();
+        const widths = this._buttonWidths(g);
+        budget = this._getBudget();
+        const max = Math.min(this._getMaxVisible(), this._list.length);
+        n = 0;
+        for (let k = max; k >= 0; k--) {
+          if (this._widthFor(k, g, widths) <= budget) { n = k; break; }
         }
+        this.style.maxWidth = Math.max(budget, g.moreW) + "px";
       }
-      this._render(best); // best may be 0: "More" still renders
 
-      const msg = `fit: window ${window.innerWidth}px − reserve → budget ${budget}px → ${best}/${this._list.length} buttons`;
+      const key = place + ":" + n;
+      if (key !== this._renderedKey) {               // only touch the DOM when something changed
+        this._render(n);
+        this._renderedKey = key;
+      }
+
+      const msg = place === "menu"
+        ? `fit: mode=menu (vertical list, ${n} items)`
+        : `fit: mode=header window ${window.innerWidth}px → budget ${budget}px → ${n}/${this._list.length} buttons`;
       if (msg !== this._lastLog) { console.log(LOG, msg); this._lastLog = msg; }
     }
 
