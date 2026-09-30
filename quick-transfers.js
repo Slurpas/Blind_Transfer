@@ -1,5 +1,5 @@
 // quick-transfers.js — Quick Transfers header widget (no build step required)
-// Registers <agentx-qt-transfers-widget>. ALL configuration lives in the desktop layout JSON.
+// Registers <agentx-qt-transfers-widget-v7>. ALL configuration lives in the desktop layout JSON.
 //
 // Layout "properties":
 //   buttons     Array of { label, dest, color?, textColor?, group? }
@@ -10,18 +10,28 @@
 //   data-max-visible  Same as maxVisible
 //   data-rows         "1" (default) or "2" = two rows of smaller buttons in the header
 //   data-confirm      "true" = ask "Transfer to X?" before transferring
-//   data-reserve      Pixels reserved for the other header items (default 700).
-//                     Widget width budget = window width - data-reserve.
+//   data-reserve      Fallback only: pixels reserved for other header items (default 300).
+//                     Used when the parent container has no measurable width yet.
+//                     Normal budget = inner width of the parent (wrapper) element.
 //   compact           Header mode
+//
+// NOTE: The tag name carries the version. When you ship a breaking change, bump
+// TAG + VERSION here AND "comp" + "?v=" in the layout, otherwise a cached layout
+// can register the old class first and the new one is silently skipped.
 
 (function () {
   "use strict";
 
-  const TAG = "agentx-qt-transfers-widget";
+  const TAG = "agentx-qt-transfers-widget-v7";
   const LOG = "[QuickTransfers]";
-  const VERSION = "v6";
+  const VERSION = "v7";
+  const DEFAULT_RESERVE = 300;
+  const MIN_BUDGET = 120;
 
-  if (customElements.get(TAG)) return;
+  if (customElements.get(TAG)) {
+    console.log(LOG, TAG, "already defined, skipping (" + VERSION + ")");
+    return;
+  }
 
   // ---------------------------------------------------------------------------
   // Colors
@@ -152,6 +162,8 @@
       this._D = null;
       this._poll = null;
       this._raf = null;
+      this._ro = null;
+      this._lastParentWidth = -1;
       this._lastLog = "";
       this._onResize = () => this._scheduleFit();
       this._boundUpdate = this.updateButtons.bind(this);
@@ -185,14 +197,28 @@
       this._upgradeProperty("buttons");
       this._upgradeProperty("maxVisible");
       window.addEventListener("resize", this._onResize); // also fires on browser zoom
+
+      // Re-fit whenever the wrapper's width changes (header settling, other widgets loading)
+      const parent = this.parentElement;
+      if (parent && typeof ResizeObserver === "function") {
+        this._ro = new ResizeObserver(entries => {
+          const w = Math.round(entries[0].contentRect.width);
+          if (Math.abs(w - this._lastParentWidth) < 2) return; // ignore our own jitter
+          this._lastParentWidth = w;
+          this._scheduleFit();
+        });
+        this._ro.observe(parent);
+      }
+
       this._fit();
-      setTimeout(() => this._scheduleFit(), 500);   // re-fit once the header has settled
+      setTimeout(() => this._scheduleFit(), 500);   // safety net once the header has settled
       setTimeout(() => this._scheduleFit(), 2000);
       this.start();
     }
 
     disconnectedCallback() {
       window.removeEventListener("resize", this._onResize);
+      if (this._ro) { this._ro.disconnect(); this._ro = null; }
       if (this._raf) { cancelAnimationFrame(this._raf); this._raf = null; }
       clearInterval(this._poll);
       const D = this._D;
@@ -221,11 +247,19 @@
       return this.getAttribute("data-rows") === "2" ? 10 : 5;
     }
 
-    // Width budget = window width minus space reserved for other header items
+    // Width budget = real inner width of the wrapper. Falls back to window - reserve.
     _getBudget() {
+      const parent = this.parentElement;
+      if (parent) {
+        const cs = getComputedStyle(parent);
+        const inner = parent.clientWidth
+          - (parseFloat(cs.paddingLeft) || 0)
+          - (parseFloat(cs.paddingRight) || 0);
+        if (inner >= MIN_BUDGET) return { budget: Math.floor(inner), source: "container" };
+      }
       const r = parseInt(this.getAttribute("data-reserve"), 10);
-      const reserve = isNaN(r) ? 700 : Math.max(0, r);
-      return Math.max(120, window.innerWidth - reserve);
+      const reserve = isNaN(r) ? DEFAULT_RESERVE : Math.max(0, r);
+      return { budget: Math.max(MIN_BUDGET, window.innerWidth - reserve), source: "window" };
     }
 
     _escape(s = "") {
@@ -249,7 +283,7 @@
       }
 
       const max = Math.min(this._getMaxVisible(), this._list.length);
-      const budget = this._getBudget();
+      const { budget, source } = this._getBudget();
       this.style.maxWidth = budget + "px";
 
       const fits = () => this._root.scrollWidth <= budget;
@@ -267,7 +301,7 @@
         this._render(best);
       }
 
-      const msg = `fit: budget ${budget}px (window ${window.innerWidth}px) → ${best}/${this._list.length} buttons`;
+      const msg = `fit: budget ${budget}px (${source}, window ${window.innerWidth}px) → ${best}/${this._list.length} buttons`;
       if (msg !== this._lastLog) { console.log(LOG, msg); this._lastLog = msg; }
     }
 
